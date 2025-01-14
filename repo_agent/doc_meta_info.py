@@ -8,12 +8,12 @@ import threading
 from dataclasses import dataclass, field
 from enum import Enum, auto, unique
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-import jedi
 from colorama import Fore, Style
 from prettytable import PrettyTable
 from tqdm import tqdm
+from tree_sitter_languages import get_parser
 
 from repo_agent.file_handler import FileHandler
 from repo_agent.log import logger
@@ -294,33 +294,109 @@ class DocItem:
 
 
 def find_all_referencer(
-    repo_path, variable_name, file_path, line_number, column_number, in_file_only=False
-):
-    """复制过来的之前的实现"""
-    script = jedi.Script(path=os.path.join(repo_path, file_path))
-    try:
-        if in_file_only:
-            references = script.get_references(
-                line=line_number, column=column_number, scope="file"
-            )
-        else:
-            references = script.get_references(line=line_number, column=column_number)
-        # 过滤出变量名为 variable_name 的引用，并返回它们的位置
-        variable_references = [ref for ref in references if ref.name == variable_name]
-        # if variable_name == "need_to_generate":
-        #     import pdb; pdb.set_trace()
-        return [
-            (os.path.relpath(ref.module_path, repo_path), ref.line, ref.column)
-            for ref in variable_references
-            if not (ref.line == line_number and ref.column == column_number)
-        ]
-    except Exception as e:
-        # 打印错误信息和相关参数
-        logger.error(f"Error occurred: {e}")
-        logger.error(
-            f"Parameters: variable_name={variable_name}, file_path={file_path}, line_number={line_number}, column_number={column_number}"
-        )
-        return []
+    repo_path: str, 
+    variable_name: str, 
+    file_path: str, 
+    line_number: int, 
+    column_number: int, 
+    in_file_only: bool = False
+) -> List[Tuple[str, int, int]]:
+    """Find all references to a variable using tree-sitter.
+    
+    Args:
+        repo_path: Root path of the repository
+        variable_name: Name of the variable to find references for
+        file_path: Path to the file containing the variable definition
+        line_number: Line number of the variable definition (1-based)
+        column_number: Column number of the variable definition
+        in_file_only: Whether to only search in the same file
+        
+    Returns:
+        List of tuples containing (file_path, line, column) for each reference
+    """
+    # Initialize tree-sitter
+    PY_LANGUAGE = "python"
+    parser = get_parser(PY_LANGUAGE)
+    
+    references = []
+    target_path = os.path.join(repo_path, file_path)
+    
+    def find_refs_in_file(search_file: str) -> List[Tuple[str, int, int]]:
+        if not os.path.exists(search_file):
+            return []
+            
+        with open(search_file, 'rb') as f:
+            content = f.read()
+        
+        tree = parser.parse(content)
+        refs = []
+        
+        def visit_node(node):
+            if node.type == 'identifier' and node.text.decode('utf-8') == variable_name:
+                # Convert byte offsets to line/column
+                start_point = node.start_point
+                # Skip the definition itself
+                if not (start_point[0] + 1 == line_number and start_point[1] == column_number):
+                    rel_path = os.path.relpath(search_file, repo_path)
+                    refs.append((rel_path, start_point[0] + 1, start_point[1]))
+            
+            for child in node.children:
+                visit_node(child)
+                
+        visit_node(tree.root_node)
+        return refs
+    
+    # Search in the target file
+    references.extend(find_refs_in_file(target_path))
+    
+    # Search in other files if needed
+    if not in_file_only:
+        for root, _, files in os.walk(repo_path):
+            for file in files:
+                if not file.endswith('.py'):
+                    continue
+                    
+                search_file = os.path.join(root, file)
+                if search_file == target_path:
+                    continue
+                    
+                references.extend(find_refs_in_file(search_file))
+    
+    # Handle imports
+    def find_imports(search_file: str) -> List[Tuple[str, int, int]]:
+        if not os.path.exists(search_file):
+            return []
+            
+        with open(search_file, 'rb') as f:
+            content = f.read()
+            
+        tree = parser.parse(content)
+        imports = []
+        
+        def visit_import(node):
+            if node.type in ('import_statement', 'import_from_statement'):
+                for child in node.children:
+                    if child.type == 'dotted_name' and child.text.decode('utf-8') == variable_name:
+                        start_point = child.start_point
+                        rel_path = os.path.relpath(search_file, repo_path)
+                        imports.append((rel_path, start_point[0] + 1, start_point[1]))
+            
+            for child in node.children:
+                visit_import(child)
+                
+        visit_import(tree.root_node)
+        return imports
+        
+    if not in_file_only:
+        for root, _, files in os.walk(repo_path):
+            for file in files:
+                if not file.endswith('.py'):
+                    continue
+                    
+                search_file = os.path.join(root, file)
+                references.extend(find_imports(search_file))
+    
+    return sorted(list(set(references)))  # Remove duplicates and sort
 
 
 @dataclass
